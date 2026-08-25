@@ -462,25 +462,11 @@ def plot_ccm_curves(df, selected_pikets=None):
 
 
 def plot_risk_heatmap(df):
-    """
-    Тепловая карта рисков: показывает три критерия (поровое давление, устойчивость, пластика)
-    и общий риск (нормализованный).
-    """
-    # Проверяем наличие флагов; если их нет, создаём из имеющихся данных (для обратной совместимости)
-    if 'flag_exceeds_u' not in df.columns:
-        # Если нет флагов, создаём их на основе существующих данных (но это приблизительно)
-        df['flag_exceeds_u'] = df['u'] > 0.7 * df['sigma_v']
-        df['flag_low_stability'] = df['stability_ratio'] < 1.0 if 'stability_ratio' in df.columns else False
-        df['flag_plastic'] = df['plastic_zone']
-
-    # Матрица: столбцы = критерии, строки = пикеты
-    matrix = df[['flag_exceeds_u', 'flag_low_stability', 'flag_plastic']].astype(int).values
-    # Добавляем общий риск (нормализованный до 0-1)
-    risk_norm = df['risk_score'] / df['risk_score'].max() if df['risk_score'].max() > 0 else df['risk_score']
-    matrix = np.column_stack([matrix, risk_norm])
-
-    labels = ['Поровое давление', 'Устойчивость', 'Пластика', 'Общий риск']
-
+    # Простой вариант: показываем только цвет пикета (red=1, green=0, yellow=0.5)
+    color_map = {'red': 1, 'yellow': 0.5, 'green': 0}
+    df['color_code'] = df['color'].map(color_map)
+    matrix = df[['color_code']].values
+    labels = ['Цвет риска']
     fig = go.Figure(data=go.Heatmap(
         z=matrix,
         x=labels,
@@ -494,7 +480,7 @@ def plot_risk_heatmap(df):
         hoverongaps=False
     ))
     fig.update_layout(
-        title='Тепловая карта рисков (причины и общий риск)',
+        title='Тепловая карта рисков',
         xaxis_title='Критерий',
         yaxis_title='Пикетаж (м)',
         height=600,
