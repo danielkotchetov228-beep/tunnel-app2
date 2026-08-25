@@ -467,7 +467,7 @@ def plot_risk_heatmap(df):
         z=matrix,
         x=labels,
         y=df['piket'].astype(str),
-        colorscale='RdYlGn_r',
+        colorscale='RdYlGn',      # <-- ИСПРАВЛЕНО: без _r
         zmin=0,
         zmax=1,
         text=matrix,
