@@ -115,9 +115,6 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
 
 
 def apply_penalty(results, penalty_factor=100):
-    """
-    Асимметричная штрафная функция с защитой от экстремалов.
-    """
     piket = results.get('piket')
     if piket is None:
         raise ValueError("Missing 'piket' in results")
@@ -128,10 +125,9 @@ def apply_penalty(results, penalty_factor=100):
 
     sigma_v = results.get('sigma_v', 0)
     u = results.get('u', 0)
-    plastic = results.get('plastic_zone', False)
+    plastic = results.get('plastic_zone', False)   # оставляем для жёлтого, но не для красного
 
     # ---------- Критерии красного ----------
-    # Порог порового давления (с учётом абсолютного порога)
     if sigma_v < 10:
         exceeds_u = u > 50.0
     else:
@@ -151,7 +147,8 @@ def apply_penalty(results, penalty_factor=100):
             stability_ratio = float('inf')
     low_stability = stability_ratio < 1.0
 
-    is_red_now = plastic or exceeds_u or low_stability
+    # Красный ТОЛЬКО если превышено поровое давление ИЛИ низкая устойчивость
+    is_red_now = exceeds_u or low_stability   # <--- ИЗМЕНЕНИЕ: пластика убрана
 
     # ---------- Асимметричная память ----------
     if is_red_prev:
@@ -163,6 +160,7 @@ def apply_penalty(results, penalty_factor=100):
             color = 'red'
         else:
             is_red_final = False
+            # Жёлтый при предупредительных признаках (включая пластику)
             if (u > 0.4 * sigma_v) or (stability_ratio < 1.5 and stability_ratio >= 1.0) or plastic:
                 color = 'yellow'
             else:
@@ -180,13 +178,12 @@ def apply_penalty(results, penalty_factor=100):
         base_risk += 0.4
     base_risk = min(base_risk, 1.0)
 
-    # ---------- Итоговый риск с учётом штрафа ----------
+    # ---------- Итоговый риск ----------
     if color == 'red':
         risk_score = base_risk * penalty_factor
     else:
         risk_score = base_risk
 
-    # Защита от NaN и inf
     if not np.isfinite(risk_score):
         risk_score = 1e9
 
