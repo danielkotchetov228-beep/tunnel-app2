@@ -316,6 +316,9 @@ def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
 
 
 def compute_full_table(df_input):
+    # Сброс памяти при новом расчёте
+    PENALTY_STATE.clear()
+    
     results_list = []
     for idx, row in df_input.iterrows():
         piket = row['piket']
@@ -335,8 +338,12 @@ def compute_full_table(df_input):
         res['gamma'] = gamma
         res['f'] = f
         res['UGW'] = UGW
-        res = apply_penalty(res)       # penalty_factor=100 по умолчанию
+        res = apply_penalty(res)
         results_list.append(res)
+
+    df_results = pd.DataFrame(results_list)
+    df_full = detect_anomalies(df_results)
+    return df_full
 
     df_results = pd.DataFrame(results_list)
     df_full = detect_anomalies(df_results)
