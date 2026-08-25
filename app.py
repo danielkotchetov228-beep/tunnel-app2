@@ -13,46 +13,84 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side
 import time
+import random
 
 # ------------------------------------------------------------
-# 1. ВЫЧИСЛИТЕЛЬНОЕ ЯДРО (полностью из предыдущего этапа)
+# ГЛОБАЛЬНОЕ СОСТОЯНИЕ ДЛЯ ШТРАФНОЙ ФУНКЦИИ
 # ------------------------------------------------------------
 PENALTY_STATE = {}
 
+# ------------------------------------------------------------
+# 1. ВЫЧИСЛИТЕЛЬНОЕ ЯДРО
+# ------------------------------------------------------------
 def calculate_piket(H, B, c, phi, gamma, f, UGW):
-    gamma_kN = gamma * 9.81
+    """
+    Расчёт параметров для одного пикета с защитой от экстремалов
+    и учётом эффективных напряжений.
+    """
+    # ---------- Защита от экстремальных значений ----------
+    if c < 1.0:
+        c = 1.0
+    if phi < 5.0:
+        phi = 5.0
+    if f < 0.5:
+        f = 0.5
+
+    gamma_kN = gamma * 9.81                     # кН/м³
     phi_rad = np.radians(phi)
     sin_phi = np.sin(phi_rad)
+    cos_phi = np.cos(phi_rad)
     tan_phi = np.tan(phi_rad)
-    K_a = np.tan(np.pi/4 - phi_rad/2)**2
+    if tan_phi < 0.1:
+        tan_phi = 0.1                          # защита от деления на ноль
+
+    K_a = np.tan(np.pi/4 - phi_rad/2)**2       # коэф. активного давления
+
+    # Вертикальное давление по Протодьяконову
     if f <= 0:
         raise ValueError("f must be > 0")
     tg_45_minus = np.tan(np.pi/4 - phi_rad/2)
     h_arch = (B + 2 * H * tg_45_minus) / (2 * f)
-    sigma_v = gamma_kN * h_arch
+
+    # Ограничение при очень большой глубине
+    if H > 80:
+        h_arch = min(h_arch, H / 3.0)
+
+    sigma_v = gamma_kN * h_arch                # кПа
+
+    # Боковое давление по Фотту
     sqrt_K_a = np.sqrt(K_a)
     sigma_h = sigma_v * K_a - 2 * c * sqrt_K_a
     if sigma_h < 0:
         sigma_h = 0.0
-    gamma_w = 9.81
+
+    # Поровое давление
+    gamma_w = 9.81                             # кН/м³
     if UGW < H:
         u = gamma_w * (H - UGW)
     else:
         u = 0.0
+
+    # Пластическая зона по эффективным напряжениям
     R_0 = B / 2.0
-    sigma_0 = gamma_kN * H
-    p_i = 0.0
-    if sin_phi == 0:
-        if sigma_0 > c:
+    sigma_0_eff = gamma_kN * H - u             # эффективное напряжение
+    if sigma_0_eff < 0:
+        sigma_0_eff = 0.0
+
+    p_i = 0.0                                  # внутреннее давление (крепи нет)
+
+    if sin_phi == 0:                           # случай φ = 0°
+        if sigma_0_eff > c:
             plastic_zone = True
-            plastic_radius = R_0 * (sigma_0 / c) if c > 0 else R_0 * 10.0
+            plastic_radius = R_0 * (sigma_0_eff / c) if c > 0 else R_0 * 10.0
         else:
             plastic_zone = False
             plastic_radius = 0.0
     else:
         cot_phi = 1.0 / tan_phi
-        term1 = (sigma_0 + c * cot_phi) * (1 - sin_phi)
+        term1 = (sigma_0_eff + c * cot_phi) * (1 - sin_phi)
         term2 = p_i + c * cot_phi
+
         if term2 <= 0:
             plastic_zone = True
             plastic_radius = R_0 * 100.0
@@ -66,6 +104,7 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
             else:
                 plastic_zone = False
                 plastic_radius = 0.0
+
     return {
         'sigma_v': sigma_v,
         'sigma_h': sigma_h,
@@ -74,18 +113,31 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
         'plastic_radius': plastic_radius
     }
 
-def apply_penalty(results, penalty_factor=1e6):
+
+def apply_penalty(results, penalty_factor=100):
+    """
+    Асимметричная штрафная функция с защитой от экстремалов.
+    """
     piket = results.get('piket')
     if piket is None:
         raise ValueError("Missing 'piket' in results")
+
     if piket not in PENALTY_STATE:
         PENALTY_STATE[piket] = {'is_red': False}
     is_red_prev = PENALTY_STATE[piket]['is_red']
+
     sigma_v = results.get('sigma_v', 0)
     u = results.get('u', 0)
-    u_limit = 0.5 * sigma_v
-    exceeds_u = u > u_limit
     plastic = results.get('plastic_zone', False)
+
+    # ---------- Критерии красного ----------
+    # Порог порового давления (с учётом абсолютного порога)
+    if sigma_v < 10:
+        exceeds_u = u > 50.0
+    else:
+        exceeds_u = u > 0.7 * sigma_v
+
+    # Коэффициент устойчивости
     stability_ratio = 1.0
     if 'c' in results and 'phi' in results and sigma_v > 0:
         phi_rad = np.radians(results['phi'])
@@ -98,7 +150,10 @@ def apply_penalty(results, penalty_factor=1e6):
         else:
             stability_ratio = float('inf')
     low_stability = stability_ratio < 1.0
+
     is_red_now = plastic or exceeds_u or low_stability
+
+    # ---------- Асимметричная память ----------
     if is_red_prev:
         is_red_final = True
         color = 'red'
@@ -108,11 +163,14 @@ def apply_penalty(results, penalty_factor=1e6):
             color = 'red'
         else:
             is_red_final = False
-            if (u > 0.3 * sigma_v) or (stability_ratio < 1.5 and stability_ratio >= 1.0) or plastic:
+            if (u > 0.4 * sigma_v) or (stability_ratio < 1.5 and stability_ratio >= 1.0) or plastic:
                 color = 'yellow'
             else:
                 color = 'green'
+
     PENALTY_STATE[piket]['is_red'] = is_red_final
+
+    # ---------- Базовый риск ----------
     base_risk = 0.0
     if plastic:
         base_risk += 0.3
@@ -121,52 +179,90 @@ def apply_penalty(results, penalty_factor=1e6):
     if low_stability:
         base_risk += 0.4
     base_risk = min(base_risk, 1.0)
+
+    # ---------- Итоговый риск с учётом штрафа ----------
     if color == 'red':
         risk_score = base_risk * penalty_factor
     else:
         risk_score = base_risk
+
+    # Защита от NaN и inf
+    if not np.isfinite(risk_score):
+        risk_score = 1e9
+
     results['color'] = color
     results['risk_score'] = risk_score
     results['is_red'] = is_red_final
     results['stability_ratio'] = stability_ratio
     return results
 
+
 def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
+    """
+    Обнаружение аномалий трёх типов с защитой от вырожденных случаев.
+    """
     df = df.copy()
     df = df.sort_values('piket').reset_index(drop=True)
     n = len(df)
+
+    # ---------- Замена NaN на средние ----------
+    for col in df.columns:
+        if df[col].isnull().any():
+            col_mean = df[col].mean(skipna=True)
+            if np.isnan(col_mean):
+                col_mean = 0.0
+            df[col].fillna(col_mean, inplace=True)
+
+    # ---------- Инициализация ----------
     df['anomaly_geomech'] = False
     df['anomaly_hydro'] = False
     df['anomaly_geol'] = False
+
+    # ---------- Адаптивный размер окна ----------
+    effective_window = min(window_size, n)
+    if effective_window < 3:
+        df['overall_risk'] = df.get('risk_score', 0)
+        return df
+
+    # ---------- Геомеханическая аномалия ----------
     for i in range(n):
-        start = max(0, i - window_size // 2)
-        end = min(n, i + window_size // 2 + 1)
+        start = max(0, i - effective_window // 2)
+        end = min(n, i + effective_window // 2 + 1)
         window_indices = list(range(start, end))
         if len(window_indices) < 3:
             continue
+
         sigma_v_win = df.loc[window_indices, 'sigma_v'].values
         sigma_h_win = df.loc[window_indices, 'sigma_h'].values
         plastic_win = df.loc[window_indices, 'plastic_zone'].astype(int).values
+
         sigma_v_i = df.loc[i, 'sigma_v']
         sigma_h_i = df.loc[i, 'sigma_h']
         plastic_i = df.loc[i, 'plastic_zone']
+
         mean_v = np.mean(sigma_v_win)
         std_v = np.std(sigma_v_win)
         if std_v > 0 and abs(sigma_v_i - mean_v) > sigma_threshold * std_v:
             df.loc[i, 'anomaly_geomech'] = True
+
         mean_h = np.mean(sigma_h_win)
         std_h = np.std(sigma_h_win)
         if std_h > 0 and abs(sigma_h_i - mean_h) > sigma_threshold * std_h:
             df.loc[i, 'anomaly_geomech'] = True
+
         plastic_fraction = np.mean(plastic_win)
         if (plastic_i == 1 and plastic_fraction < 0.3) or (plastic_i == 0 and plastic_fraction > 0.7):
             df.loc[i, 'anomaly_geomech'] = True
-    df['H'] = df['H'] if 'H' in df.columns else 0
+
+    # ---------- Гидрогеологическая аномалия ----------
+    if 'H' not in df.columns:
+        df['H'] = 0
     for i in range(n):
         if df.loc[i, 'UGW'] > 0.7 * df.loc[i, 'H']:
             df.loc[i, 'anomaly_hydro'] = True
-        start = max(0, i - window_size // 2)
-        end = min(n, i + window_size // 2 + 1)
+
+        start = max(0, i - effective_window // 2)
+        end = min(n, i + effective_window // 2 + 1)
         window_indices = list(range(start, end))
         if len(window_indices) < 3:
             continue
@@ -176,30 +272,38 @@ def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
         std_u = np.std(u_win)
         if std_u > 0 and abs(u_i - mean_u) > sigma_threshold * std_u:
             df.loc[i, 'anomaly_hydro'] = True
+
+    # ---------- Геологическая аномалия ----------
     for i in range(n):
         f_i = df.loc[i, 'f']
         phi_i = df.loc[i, 'phi']
         c_i = df.loc[i, 'c']
+
         if f_i < 3.0 and phi_i > 35.0 and c_i < 20.0:
             df.loc[i, 'anomaly_geol'] = True
-        start = max(0, i - window_size // 2)
-        end = min(n, i + window_size // 2 + 1)
+
+        start = max(0, i - effective_window // 2)
+        end = min(n, i + effective_window // 2 + 1)
         window_indices = list(range(start, end))
         if len(window_indices) < 3:
             continue
         f_win = df.loc[window_indices, 'f'].values
         phi_win = df.loc[window_indices, 'phi'].values
         c_win = df.loc[window_indices, 'c'].values
+
         mean_f = np.mean(f_win)
         std_f = np.std(f_win)
         mean_phi = np.mean(phi_win)
         std_phi = np.std(phi_win)
         mean_c = np.mean(c_win)
         std_c = np.std(c_win)
+
         if (std_f > 0 and abs(f_i - mean_f) > sigma_threshold * std_f) or \
            (std_phi > 0 and abs(phi_i - mean_phi) > sigma_threshold * std_phi) or \
            (std_c > 0 and abs(c_i - mean_c) > sigma_threshold * std_c):
             df.loc[i, 'anomaly_geol'] = True
+
+    # ---------- Общий риск ----------
     if 'risk_score' in df.columns:
         df['overall_risk'] = df['risk_score']
     else:
@@ -207,7 +311,9 @@ def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
                               df['anomaly_hydro'].astype(int) +
                               df['anomaly_geol'].astype(int) +
                               df['plastic_zone'].astype(int))
+
     return df
+
 
 def compute_full_table(df_input):
     results_list = []
@@ -229,11 +335,13 @@ def compute_full_table(df_input):
         res['gamma'] = gamma
         res['f'] = f
         res['UGW'] = UGW
-        res = apply_penalty(res)
+        res = apply_penalty(res)       # penalty_factor=100 по умолчанию
         results_list.append(res)
+
     df_results = pd.DataFrame(results_list)
     df_full = detect_anomalies(df_results)
     return df_full
+
 
 # ------------------------------------------------------------
 # 2. ВИЗУАЛИЗАЦИЯ (plotly)
@@ -272,9 +380,11 @@ def plot_longitudinal_profile(df):
         xaxis_title='Пикетаж (м)',
         yaxis_title='Отметка (м)',
         hovermode='x unified',
-        template='plotly_white'
+        template='plotly_white',
+        height=600
     )
     return fig
+
 
 def plot_picket_epures(df, piket_index):
     row = df[df['piket'] == piket_index]
@@ -290,6 +400,7 @@ def plot_picket_epures(df, piket_index):
     if row['UGW'] < row['H']:
         mask = depth > row['UGW']
         u_vals[mask] = 9.81 * (depth[mask] - row['UGW'])
+
     fig = make_subplots(
         rows=1, cols=4,
         subplot_titles=('σ_v (кПа)', 'σ_h (кПа)', 'Поровое u (кПа)', 'Зона пластики')
@@ -301,14 +412,21 @@ def plot_picket_epures(df, piket_index):
     fig.add_trace(go.Bar(x=[plastic_val], y=[row['H']], name='Пластика', orientation='v',
                          marker_color='orange' if plastic_val else 'lightgreen'),
                   row=1, col=4)
+
     for i in range(1, 4):
-        fig.update_yaxes(title_text="Глубина (м)", autorange="reversed", row=1, col=i)
-    fig.update_xaxes(title_text="Напряжение (кПа)", row=1, col=1)
-    fig.update_xaxes(title_text="Давление (кПа)", row=1, col=2)
-    fig.update_xaxes(title_text="Давление (кПа)", row=1, col=3)
-    fig.update_xaxes(title_text="Пластика", row=1, col=4)
-    fig.update_layout(height=500, showlegend=False, template='plotly_white')
+        fig.update_yaxes(title_text='Глубина (м)', autorange='reversed', row=1, col=i)
+    fig.update_xaxes(title_text='Напряжение (кПа)', row=1, col=1)
+    fig.update_xaxes(title_text='Давление (кПа)', row=1, col=2)
+    fig.update_xaxes(title_text='Давление (кПа)', row=1, col=3)
+    fig.update_xaxes(title_text='Пластика', row=1, col=4)
+
+    fig.update_layout(
+        height=550,
+        showlegend=False,
+        template='plotly_white'
+    )
     return fig
+
 
 def plot_ccm_curves(df, selected_pikets=None):
     if selected_pikets is None:
@@ -329,9 +447,11 @@ def plot_ccm_curves(df, selected_pikets=None):
         xaxis_title='Деформация ε',
         yaxis_title='Нагрузка (кПа)',
         hovermode='x',
-        template='plotly_white'
+        template='plotly_white',
+        height=450
     )
     return fig
+
 
 def plot_risk_heatmap(df):
     risk_types = ['anomaly_geomech', 'anomaly_hydro', 'anomaly_geol']
@@ -355,18 +475,22 @@ def plot_risk_heatmap(df):
         title='Тепловая карта рисков',
         xaxis_title='Тип риска',
         yaxis_title='Пикетаж (м)',
-        height=400 + 30 * len(df),
+        height=600,
         template='plotly_white'
     )
     return fig
+
 
 def plot_anomaly_table(df):
     df_display = df.copy()
     def anomaly_type(row):
         types = []
-        if row['anomaly_geomech']: types.append('Геомех.')
-        if row['anomaly_hydro']: types.append('Гидро')
-        if row['anomaly_geol']: types.append('Геол.')
+        if row['anomaly_geomech']:
+            types.append('Геомех.')
+        if row['anomaly_hydro']:
+            types.append('Гидро')
+        if row['anomaly_geol']:
+            types.append('Геол.')
         return ', '.join(types) if types else 'Нет'
     df_display['Тип аномалии'] = df_display.apply(anomaly_type, axis=1)
     cols = ['piket', 'H', 'sigma_v', 'sigma_h', 'u', 'plastic_zone', 'color', 'Тип аномалии']
@@ -381,7 +505,10 @@ def plot_anomaly_table(df):
         ),
         cells=dict(
             values=[table_data[col] for col in table_data.columns],
-            fill_color=[['lightgreen' if c == 'green' else 'lightyellow' if c == 'yellow' else 'lightcoral' for c in table_data['color']]],
+            fill_color=[
+                ['lightgreen' if c == 'green' else 'lightyellow' if c == 'yellow' else 'lightcoral'
+                 for c in table_data['color']]
+            ],
             align='center',
             font=dict(size=11)
         )
@@ -392,6 +519,7 @@ def plot_anomaly_table(df):
         template='plotly_white'
     )
     return fig
+
 
 # ------------------------------------------------------------
 # 3. ГЕНЕРАЦИЯ ОТЧЁТОВ
@@ -404,6 +532,7 @@ def generate_docx_bytes(df, project_name="Тоннель"):
     style.paragraph_format.line_spacing = 1.5
     style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
+    # Титул
     doc.add_paragraph('\n' * 6)
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -430,6 +559,7 @@ def generate_docx_bytes(df, project_name="Тоннель"):
                  'Представленные расчёты носят рекомендательный характер и не отменяют экспертизу.')
     doc.add_page_break()
 
+    # 1. Вводные параметры
     doc.add_heading('1. Вводные параметры', level=1)
     input_cols = ['piket', 'H', 'B', 'c', 'phi', 'gamma', 'f', 'UGW']
     header_map = {
@@ -458,6 +588,7 @@ def generate_docx_bytes(df, project_name="Тоннель"):
             row_cells[i].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph()
 
+    # 2. Результаты расчётов
     doc.add_heading('2. Результаты расчётов', level=1)
     result_cols = ['piket', 'sigma_v', 'sigma_h', 'u', 'plastic_zone', 'color', 'risk_score']
     header_map_res = {
@@ -495,18 +626,21 @@ def generate_docx_bytes(df, project_name="Тоннель"):
                     row_cells[i].paragraphs[0].runs[0].font.color.rgb = RGBColor(0, 128, 0)
     doc.add_paragraph()
 
+    # 3. Заключение (исправлено)
     doc.add_heading('3. Заключение', level=1)
-    anomaly_cols = ['anomaly_geomech', 'anomaly_hydro', 'anomaly_geol']
-    has_anomaly = df[anomaly_cols].any(axis=1)
-    critical_mask = (df['color'].isin(['red', 'yellow'])) & has_anomaly
+    critical_mask = df['color'].isin(['red', 'yellow'])
     critical_pikets = df[critical_mask]['piket'].tolist()
     if critical_pikets:
-        p = doc.add_paragraph('Следующие пикеты требуют дополнительной проверки:')
+        p = doc.add_paragraph('Следующие пикеты требуют дополнительной проверки (красные или жёлтые):')
         p.add_run(f' {", ".join(map(str, critical_pikets))}').bold = True
+        doc.add_paragraph('Обратите внимание: для этих пикетов рекомендуется провести детальный анализ '
+                          'и при необходимости скорректировать проект.')
     else:
-        doc.add_paragraph('Пикеты, требующие проверки, не обнаружены.')
+        doc.add_paragraph('Все пикеты находятся в зелёной зоне. Дополнительная проверка не требуется.')
 
     doc.add_paragraph()
+
+    # Нормативная база
     doc.add_heading('Нормативная база', level=2)
     doc.add_paragraph('• СП 122.13330.2012 "Тоннели железнодорожные и автодорожные"')
     doc.add_paragraph('• ГОСТ 33153-2014 "Дороги автомобильные общего пользования. Тоннели автомобильные. Правила проектирования"')
@@ -516,6 +650,7 @@ def generate_docx_bytes(df, project_name="Тоннель"):
     doc.save(bio)
     bio.seek(0)
     return bio.getvalue()
+
 
 def generate_xlsx_bytes(df):
     wb = Workbook()
@@ -549,6 +684,7 @@ def generate_xlsx_bytes(df):
     bio.seek(0)
     return bio.getvalue()
 
+
 # ------------------------------------------------------------
 # 4. STREAMLIT ИНТЕРФЕЙС
 # ------------------------------------------------------------
@@ -568,7 +704,7 @@ if 'results' not in st.session_state:
 if 'project_name' not in st.session_state:
     st.session_state['project_name'] = "Тоннель №1"
 
-# Боковая панель для загрузки
+# Боковая панель
 with st.sidebar:
     st.header("Загрузка данных")
     uploaded_file = st.file_uploader("Выберите CSV или Excel файл", type=["csv", "xlsx"])
@@ -635,11 +771,11 @@ if st.session_state['results'] is not None:
         st.plotly_chart(plot_picket_epures(df_res, piket_input), use_container_width=True)
 
     with tab3:
-        # Выбор пикетов через мультиселект
         selected = st.multiselect("Выберите пикеты для кривых CCM", df_res['piket'].tolist(), default=df_res['piket'].iloc[:3].tolist())
         st.plotly_chart(plot_ccm_curves(df_res, selected), use_container_width=True)
 
     with tab4:
+        # Исправлено: теперь тепловая карта отображается через plotly
         st.plotly_chart(plot_risk_heatmap(df_res), use_container_width=True)
 
     with tab5:
