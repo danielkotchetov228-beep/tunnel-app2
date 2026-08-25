@@ -191,6 +191,10 @@ def apply_penalty(results, penalty_factor=100):
     results['risk_score'] = risk_score
     results['is_red'] = is_red_final
     results['stability_ratio'] = stability_ratio
+    # Добавляем флаги в results
+    results['flag_exceeds_u'] = exceeds_u
+    results['flag_low_stability'] = low_stability
+    results['flag_plastic'] = plastic
     return results
 
 
@@ -458,16 +462,30 @@ def plot_ccm_curves(df, selected_pikets=None):
 
 
 def plot_risk_heatmap(df):
-    risk_types = ['anomaly_geomech', 'anomaly_hydro', 'anomaly_geol']
-    matrix = df[risk_types].astype(int).values
-    risk_score_norm = df['risk_score'] / df['risk_score'].max() if df['risk_score'].max() > 0 else df['risk_score']
-    matrix = np.column_stack([matrix, risk_score_norm])
-    labels = ['Геомех.', 'Гидро', 'Геол.', 'Общий']
+    """
+    Тепловая карта рисков: показывает три критерия (поровое давление, устойчивость, пластика)
+    и общий риск (нормализованный).
+    """
+    # Проверяем наличие флагов; если их нет, создаём из имеющихся данных (для обратной совместимости)
+    if 'flag_exceeds_u' not in df.columns:
+        # Если нет флагов, создаём их на основе существующих данных (но это приблизительно)
+        df['flag_exceeds_u'] = df['u'] > 0.7 * df['sigma_v']
+        df['flag_low_stability'] = df['stability_ratio'] < 1.0 if 'stability_ratio' in df.columns else False
+        df['flag_plastic'] = df['plastic_zone']
+
+    # Матрица: столбцы = критерии, строки = пикеты
+    matrix = df[['flag_exceeds_u', 'flag_low_stability', 'flag_plastic']].astype(int).values
+    # Добавляем общий риск (нормализованный до 0-1)
+    risk_norm = df['risk_score'] / df['risk_score'].max() if df['risk_score'].max() > 0 else df['risk_score']
+    matrix = np.column_stack([matrix, risk_norm])
+
+    labels = ['Поровое давление', 'Устойчивость', 'Пластика', 'Общий риск']
+
     fig = go.Figure(data=go.Heatmap(
         z=matrix,
         x=labels,
         y=df['piket'].astype(str),
-        colorscale='RdYlGn',      # <-- ИСПРАВЛЕНО: без _r
+        colorscale='RdYlGn_r',
         zmin=0,
         zmax=1,
         text=matrix,
@@ -476,8 +494,8 @@ def plot_risk_heatmap(df):
         hoverongaps=False
     ))
     fig.update_layout(
-        title='Тепловая карта рисков',
-        xaxis_title='Тип риска',
+        title='Тепловая карта рисков (причины и общий риск)',
+        xaxis_title='Критерий',
         yaxis_title='Пикетаж (м)',
         height=600,
         template='plotly_white'
