@@ -21,12 +21,14 @@ import random
 PENALTY_STATE = {}
 
 # ------------------------------------------------------------
-# 1. ВЫЧИСЛИТЕЛЬНОЕ ЯДРО
+# 1. ВЫЧИСЛИТЕЛЬНОЕ ЯДРО (ОБНОВЛЁННОЕ)
 # ------------------------------------------------------------
 def calculate_piket(H, B, c, phi, gamma, f, UGW):
     """
-    Расчёт параметров для одного пикета с защитой от экстремалов
-    и учётом эффективных напряжений.
+    Расчёт параметров для одного пикета.
+    Вертикальное давление: полное горное давление sigma_v = gamma_kN * H.
+    Боковое давление: по методу Фотта с использованием нового sigma_v.
+    Пластическая зона: по эффективному напряжению sigma_0_eff = gamma_kN * H - u.
     """
     # ---------- Защита от экстремальных значений ----------
     if c < 1.0:
@@ -42,44 +44,40 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
     cos_phi = np.cos(phi_rad)
     tan_phi = np.tan(phi_rad)
     if tan_phi < 0.1:
-        tan_phi = 0.1                          # защита от деления на ноль
+        tan_phi = 0.1
 
-    K_a = np.tan(np.pi/4 - phi_rad/2)**2       # коэф. активного давления
+    # ---------- Вертикальное давление (полное горное) ----------
+    sigma_v = gamma_kN * H
 
-    # Вертикальное давление по Протодьяконову
-    if f <= 0:
-        raise ValueError("f must be > 0")
+    # ---------- (Информационно) высота свода обрушения по Протодьяконову ----------
     tg_45_minus = np.tan(np.pi/4 - phi_rad/2)
-    h_arch = (B + 2 * H * tg_45_minus) / (2 * f)
-
-    # Ограничение при очень большой глубине
+    h_arch = (B + 2 * H * tg_45_minus) / (2 * f) if f > 0 else 0.0
     if H > 80:
         h_arch = min(h_arch, H / 3.0)
 
-    sigma_v = gamma_kN * h_arch                # кПа
-
-    # Боковое давление по Фотту
+    # ---------- Боковое давление (метод Фотта) ----------
+    K_a = np.tan(np.pi/4 - phi_rad/2)**2
     sqrt_K_a = np.sqrt(K_a)
     sigma_h = sigma_v * K_a - 2 * c * sqrt_K_a
     if sigma_h < 0:
         sigma_h = 0.0
 
-    # Поровое давление
-    gamma_w = 9.81                             # кН/м³
+    # ---------- Поровое давление ----------
+    gamma_w = 9.81
     if UGW < H:
         u = gamma_w * (H - UGW)
     else:
         u = 0.0
 
-    # Пластическая зона по эффективным напряжениям
+    # ---------- Пластическая зона (по эффективным напряжениям) ----------
     R_0 = B / 2.0
-    sigma_0_eff = gamma_kN * H - u             # эффективное напряжение
+    sigma_0_eff = gamma_kN * H - u
     if sigma_0_eff < 0:
         sigma_0_eff = 0.0
 
-    p_i = 0.0                                  # внутреннее давление (крепи нет)
+    p_i = 0.0
 
-    if sin_phi == 0:                           # случай φ = 0°
+    if sin_phi == 0:
         if sigma_0_eff > c:
             plastic_zone = True
             plastic_radius = R_0 * (sigma_0_eff / c) if c > 0 else R_0 * 10.0
@@ -110,11 +108,19 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
         'sigma_h': sigma_h,
         'u': u,
         'plastic_zone': plastic_zone,
-        'plastic_radius': plastic_radius
+        'plastic_radius': plastic_radius,
+        'h_arch': h_arch
     }
 
 
 def apply_penalty(results, penalty_factor=100):
+    """
+    Асимметричная штрафная функция с обновлённой логикой.
+    - Порог превышения порового давления: u > 0.8 * sigma_v.
+    - Устойчивость считается по эффективному напряжению.
+    - Красный: (exceeds_u and low_stability) or (plastic and exceeds_u).
+    - Сохраняются флаги для тепловой карты.
+    """
     piket = results.get('piket')
     if piket is None:
         raise ValueError("Missing 'piket' in results")
@@ -125,20 +131,19 @@ def apply_penalty(results, penalty_factor=100):
 
     sigma_v = results.get('sigma_v', 0)
     u = results.get('u', 0)
-    plastic = results.get('plastic_zone', False)   # оставляем для жёлтого, но не для красного
+    plastic = results.get('plastic_zone', False)
 
-    # ---------- Критерии красного ----------
-    if sigma_v < 10:
-        exceeds_u = u > 50.0
-    else:
-        exceeds_u = u > 0.7 * sigma_v
+    # ---------- 1. Превышение порового давления (новый порог 0.8) ----------
+    exceeds_u = u > 0.8 * sigma_v
 
-    # Коэффициент устойчивости
+    # ---------- 2. Коэффициент устойчивости (по эффективным напряжениям) ----------
     stability_ratio = 1.0
     if 'c' in results and 'phi' in results and sigma_v > 0:
         phi_rad = np.radians(results['phi'])
-        sigma_n = sigma_v
-        tau_lim = results['c'] + sigma_n * np.tan(phi_rad)
+        sigma_eff = sigma_v - u
+        if sigma_eff < 0:
+            sigma_eff = 0
+        tau_lim = results['c'] + sigma_eff * np.tan(phi_rad)
         sigma_h = results.get('sigma_h', 0)
         tau_act = (sigma_v - sigma_h) / 2 if sigma_v > sigma_h else 0.5
         if tau_act > 0:
@@ -147,10 +152,10 @@ def apply_penalty(results, penalty_factor=100):
             stability_ratio = float('inf')
     low_stability = stability_ratio < 1.0
 
-    # Красный ТОЛЬКО если превышено поровое давление ИЛИ низкая устойчивость
-    is_red_now = exceeds_u or low_stability   # <--- ИЗМЕНЕНИЕ: пластика убрана
+    # ---------- 3. Логика красного цвета ----------
+    is_red_now = (exceeds_u and low_stability) or (plastic and exceeds_u)
 
-    # ---------- Асимметричная память ----------
+    # ---------- 4. Асимметричная память и финальный цвет ----------
     if is_red_prev:
         is_red_final = True
         color = 'red'
@@ -160,15 +165,14 @@ def apply_penalty(results, penalty_factor=100):
             color = 'red'
         else:
             is_red_final = False
-            # Жёлтый при предупредительных признаках (включая пластику)
-            if (u > 0.4 * sigma_v) or (stability_ratio < 1.5 and stability_ratio >= 1.0) or plastic:
+            if plastic or exceeds_u or (stability_ratio < 1.5 and stability_ratio >= 1.0):
                 color = 'yellow'
             else:
                 color = 'green'
 
     PENALTY_STATE[piket]['is_red'] = is_red_final
 
-    # ---------- Базовый риск ----------
+    # ---------- 5. Базовый риск (для числовой оценки) ----------
     base_risk = 0.0
     if plastic:
         base_risk += 0.3
@@ -178,35 +182,33 @@ def apply_penalty(results, penalty_factor=100):
         base_risk += 0.4
     base_risk = min(base_risk, 1.0)
 
-    # ---------- Итоговый риск ----------
     if color == 'red':
-        risk_score = base_risk * penalty_factor
+        risk_score = 1.0
+    elif color == 'yellow':
+        risk_score = 0.5
     else:
-        risk_score = base_risk
+        risk_score = 0.0
 
     if not np.isfinite(risk_score):
         risk_score = 1e9
 
+    # ---------- 6. Сохранение результатов ----------
     results['color'] = color
     results['risk_score'] = risk_score
     results['is_red'] = is_red_final
     results['stability_ratio'] = stability_ratio
-    # Добавляем флаги в results
     results['flag_exceeds_u'] = exceeds_u
     results['flag_low_stability'] = low_stability
     results['flag_plastic'] = plastic
+
     return results
 
 
 def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
-    """
-    Обнаружение аномалий трёх типов с защитой от вырожденных случаев.
-    """
     df = df.copy()
     df = df.sort_values('piket').reset_index(drop=True)
     n = len(df)
 
-    # ---------- Замена NaN на средние ----------
     for col in df.columns:
         if df[col].isnull().any():
             col_mean = df[col].mean(skipna=True)
@@ -214,18 +216,15 @@ def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
                 col_mean = 0.0
             df[col].fillna(col_mean, inplace=True)
 
-    # ---------- Инициализация ----------
     df['anomaly_geomech'] = False
     df['anomaly_hydro'] = False
     df['anomaly_geol'] = False
 
-    # ---------- Адаптивный размер окна ----------
     effective_window = min(window_size, n)
     if effective_window < 3:
         df['overall_risk'] = df.get('risk_score', 0)
         return df
 
-    # ---------- Геомеханическая аномалия ----------
     for i in range(n):
         start = max(0, i - effective_window // 2)
         end = min(n, i + effective_window // 2 + 1)
@@ -255,7 +254,6 @@ def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
         if (plastic_i == 1 and plastic_fraction < 0.3) or (plastic_i == 0 and plastic_fraction > 0.7):
             df.loc[i, 'anomaly_geomech'] = True
 
-    # ---------- Гидрогеологическая аномалия ----------
     if 'H' not in df.columns:
         df['H'] = 0
     for i in range(n):
@@ -274,7 +272,6 @@ def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
         if std_u > 0 and abs(u_i - mean_u) > sigma_threshold * std_u:
             df.loc[i, 'anomaly_hydro'] = True
 
-    # ---------- Геологическая аномалия ----------
     for i in range(n):
         f_i = df.loc[i, 'f']
         phi_i = df.loc[i, 'phi']
@@ -304,7 +301,6 @@ def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
            (std_c > 0 and abs(c_i - mean_c) > sigma_threshold * std_c):
             df.loc[i, 'anomaly_geol'] = True
 
-    # ---------- Общий риск ----------
     if 'risk_score' in df.columns:
         df['overall_risk'] = df['risk_score']
     else:
@@ -317,9 +313,7 @@ def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
 
 
 def compute_full_table(df_input):
-    # Сброс памяти при новом расчёте
     PENALTY_STATE.clear()
-    
     results_list = []
     for idx, row in df_input.iterrows():
         piket = row['piket']
@@ -341,10 +335,6 @@ def compute_full_table(df_input):
         res['UGW'] = UGW
         res = apply_penalty(res)
         results_list.append(res)
-
-    df_results = pd.DataFrame(results_list)
-    df_full = detect_anomalies(df_results)
-    return df_full
 
     df_results = pd.DataFrame(results_list)
     df_full = detect_anomalies(df_results)
@@ -462,11 +452,25 @@ def plot_ccm_curves(df, selected_pikets=None):
 
 
 def plot_risk_heatmap(df):
-    # Простой вариант: показываем только цвет пикета (red=1, green=0, yellow=0.5)
-    color_map = {'red': 1, 'yellow': 0.5, 'green': 0}
-    df['color_code'] = df['color'].map(color_map)
-    matrix = df[['color_code']].values
-    labels = ['Цвет риска']
+    """
+    Тепловая карта рисков: показывает три критерия (поровое давление, устойчивость, пластика)
+    и общий риск (normalized risk_score).
+    """
+    # Проверяем наличие флагов; если их нет, создаём из имеющихся данных (для обратной совместимости)
+    if 'flag_exceeds_u' not in df.columns:
+        # Если нет флагов, создаём их на основе существующих данных (приблизительно)
+        df['flag_exceeds_u'] = df['u'] > 0.8 * df['sigma_v']
+        df['flag_low_stability'] = df['stability_ratio'] < 1.0 if 'stability_ratio' in df.columns else False
+        df['flag_plastic'] = df['plastic_zone']
+
+    # Матрица: столбцы = критерии, строки = пикеты
+    matrix = df[['flag_exceeds_u', 'flag_low_stability', 'flag_plastic']].astype(int).values
+    # Добавляем общий риск (нормализованный до 0-1)
+    risk_norm = df['risk_score'] / df['risk_score'].max() if df['risk_score'].max() > 0 else df['risk_score']
+    matrix = np.column_stack([matrix, risk_norm])
+
+    labels = ['Поровое давление', 'Устойчивость', 'Пластика', 'Общий риск']
+
     fig = go.Figure(data=go.Heatmap(
         z=matrix,
         x=labels,
@@ -480,7 +484,7 @@ def plot_risk_heatmap(df):
         hoverongaps=False
     ))
     fig.update_layout(
-        title='Тепловая карта рисков',
+        title='Тепловая карта рисков (причины и общий риск)',
         xaxis_title='Критерий',
         yaxis_title='Пикетаж (м)',
         height=600,
@@ -540,7 +544,6 @@ def generate_docx_bytes(df, project_name="Тоннель"):
     style.paragraph_format.line_spacing = 1.5
     style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
-    # Титул
     doc.add_paragraph('\n' * 6)
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -567,7 +570,6 @@ def generate_docx_bytes(df, project_name="Тоннель"):
                  'Представленные расчёты носят рекомендательный характер и не отменяют экспертизу.')
     doc.add_page_break()
 
-    # 1. Вводные параметры
     doc.add_heading('1. Вводные параметры', level=1)
     input_cols = ['piket', 'H', 'B', 'c', 'phi', 'gamma', 'f', 'UGW']
     header_map = {
@@ -596,7 +598,6 @@ def generate_docx_bytes(df, project_name="Тоннель"):
             row_cells[i].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph()
 
-    # 2. Результаты расчётов
     doc.add_heading('2. Результаты расчётов', level=1)
     result_cols = ['piket', 'sigma_v', 'sigma_h', 'u', 'plastic_zone', 'color', 'risk_score']
     header_map_res = {
@@ -634,7 +635,6 @@ def generate_docx_bytes(df, project_name="Тоннель"):
                     row_cells[i].paragraphs[0].runs[0].font.color.rgb = RGBColor(0, 128, 0)
     doc.add_paragraph()
 
-    # 3. Заключение (исправлено)
     doc.add_heading('3. Заключение', level=1)
     critical_mask = df['color'].isin(['red', 'yellow'])
     critical_pikets = df[critical_mask]['piket'].tolist()
@@ -647,8 +647,6 @@ def generate_docx_bytes(df, project_name="Тоннель"):
         doc.add_paragraph('Все пикеты находятся в зелёной зоне. Дополнительная проверка не требуется.')
 
     doc.add_paragraph()
-
-    # Нормативная база
     doc.add_heading('Нормативная база', level=2)
     doc.add_paragraph('• СП 122.13330.2012 "Тоннели железнодорожные и автодорожные"')
     doc.add_paragraph('• ГОСТ 33153-2014 "Дороги автомобильные общего пользования. Тоннели автомобильные. Правила проектирования"')
@@ -783,7 +781,6 @@ if st.session_state['results'] is not None:
         st.plotly_chart(plot_ccm_curves(df_res, selected), use_container_width=True)
 
     with tab4:
-        # Исправлено: теперь тепловая карта отображается через plotly
         st.plotly_chart(plot_risk_heatmap(df_res), use_container_width=True)
 
     with tab5:
