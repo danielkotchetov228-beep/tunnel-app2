@@ -113,13 +113,12 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
     }
 
 
-def apply_penalty(results, penalty_factor=100):
+def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, include_plastic=False):
     """
-    Асимметричная штрафная функция с обновлённой логикой.
-    - Порог превышения порового давления: u > 0.8 * sigma_v.
-    - Устойчивость считается по эффективному напряжению.
-    - Красный: (exceeds_u and low_stability) or (plastic and exceeds_u).
-    - Сохраняются флаги для тепловой карты.
+    Асимметричная штрафная функция с настраиваемыми порогами.
+    - excess_threshold: порог для u / sigma_v (по умолчанию 0.9)
+    - stability_threshold: порог для stability_ratio (по умолчанию 0.8)
+    - include_plastic: если True, то пластика участвует в критерии красного
     """
     piket = results.get('piket')
     if piket is None:
@@ -133,10 +132,10 @@ def apply_penalty(results, penalty_factor=100):
     u = results.get('u', 0)
     plastic = results.get('plastic_zone', False)
 
-    # ---------- 1. Превышение порового давления (новый порог 0.8) ----------
-    exceeds_u = u > 0.8 * sigma_v
+    # 1. Превышение порового давления с настраиваемым порогом
+    exceeds_u = u > excess_threshold * sigma_v
 
-    # ---------- 2. Коэффициент устойчивости (по эффективным напряжениям) ----------
+    # 2. Коэффициент устойчивости (по эффективным напряжениям)
     stability_ratio = 1.0
     if 'c' in results and 'phi' in results and sigma_v > 0:
         phi_rad = np.radians(results['phi'])
@@ -150,12 +149,15 @@ def apply_penalty(results, penalty_factor=100):
             stability_ratio = tau_lim / tau_act
         else:
             stability_ratio = float('inf')
-    low_stability = stability_ratio < 1.0
+    low_stability = stability_ratio < stability_threshold
 
-    # ---------- 3. Логика красного цвета ----------
-    is_red_now = (exceeds_u and low_stability) or (plastic and exceeds_u)
+    # 3. Логика красного с учётом include_plastic
+    if include_plastic:
+        is_red_now = (exceeds_u and low_stability) or (plastic and exceeds_u)
+    else:
+        is_red_now = exceeds_u and low_stability
 
-    # ---------- 4. Асимметричная память и финальный цвет ----------
+    # Асимметричная память
     if is_red_prev:
         is_red_final = True
         color = 'red'
@@ -165,23 +167,15 @@ def apply_penalty(results, penalty_factor=100):
             color = 'red'
         else:
             is_red_final = False
-            if plastic or exceeds_u or (stability_ratio < 1.5 and stability_ratio >= 1.0):
+            # Жёлтый: любое одно из условий (exceeds_u, low_stability, plastic)
+            if exceeds_u or low_stability or plastic:
                 color = 'yellow'
             else:
                 color = 'green'
 
     PENALTY_STATE[piket]['is_red'] = is_red_final
 
-    # ---------- 5. Базовый риск (для числовой оценки) ----------
-    base_risk = 0.0
-    if plastic:
-        base_risk += 0.3
-    if exceeds_u:
-        base_risk += 0.3
-    if low_stability:
-        base_risk += 0.4
-    base_risk = min(base_risk, 1.0)
-
+    # Риск
     if color == 'red':
         risk_score = 1.0
     elif color == 'yellow':
@@ -192,7 +186,6 @@ def apply_penalty(results, penalty_factor=100):
     if not np.isfinite(risk_score):
         risk_score = 1e9
 
-    # ---------- 6. Сохранение результатов ----------
     results['color'] = color
     results['risk_score'] = risk_score
     results['is_red'] = is_red_final
@@ -312,7 +305,7 @@ def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
     return df
 
 
-def compute_full_table(df_input):
+def compute_full_table(df_input, excess_threshold=0.9, stability_threshold=0.8, include_plastic=False):
     PENALTY_STATE.clear()
     results_list = []
     for idx, row in df_input.iterrows():
@@ -333,7 +326,7 @@ def compute_full_table(df_input):
         res['gamma'] = gamma
         res['f'] = f
         res['UGW'] = UGW
-        res = apply_penalty(res)
+        res = apply_penalty(res, excess_threshold, stability_threshold, include_plastic)
         results_list.append(res)
 
     df_results = pd.DataFrame(results_list)
@@ -451,43 +444,55 @@ def plot_ccm_curves(df, selected_pikets=None):
     return fig
 
 
-def plot_risk_heatmap(df):
+def plot_correlation_matrix(df):
     """
-    Тепловая карта рисков: показывает три критерия (поровое давление, устойчивость, пластика)
-    и общий риск (normalized risk_score).
+    Интерактивная корреляционная матрица для числовых параметров.
+    Отображает корреляции между входными данными и результатами расчёта.
     """
-    # Проверяем наличие флагов; если их нет, создаём из имеющихся данных (для обратной совместимости)
-    if 'flag_exceeds_u' not in df.columns:
-        # Если нет флагов, создаём их на основе существующих данных (приблизительно)
-        df['flag_exceeds_u'] = df['u'] > 0.8 * df['sigma_v']
-        df['flag_low_stability'] = df['stability_ratio'] < 1.0 if 'stability_ratio' in df.columns else False
-        df['flag_plastic'] = df['plastic_zone']
+    df_corr = df.copy()
+    df_corr['plastic_int'] = df_corr['plastic_zone'].astype(int)
 
-    # Матрица: столбцы = критерии, строки = пикеты
-    matrix = df[['flag_exceeds_u', 'flag_low_stability', 'flag_plastic']].astype(int).values
-    # Добавляем общий риск (нормализованный до 0-1)
-    risk_norm = df['risk_score'] / df['risk_score'].max() if df['risk_score'].max() > 0 else df['risk_score']
-    matrix = np.column_stack([matrix, risk_norm])
+    numeric_cols = ['H', 'B', 'c', 'phi', 'gamma', 'f', 'UGW', 
+                    'sigma_v', 'sigma_h', 'u', 'risk_score', 'plastic_int']
+    available_cols = [col for col in numeric_cols if col in df_corr.columns]
+    corr_matrix = df_corr[available_cols].corr()
 
-    labels = ['Поровое давление', 'Устойчивость', 'Пластика', 'Общий риск']
+    rename_map = {
+        'H': 'Глубина H',
+        'B': 'Диаметр B',
+        'c': 'Сцепление c',
+        'phi': 'Угол трения φ',
+        'gamma': 'Плотность γ',
+        'f': 'Крепость f',
+        'UGW': 'УГВ',
+        'sigma_v': 'σ_v',
+        'sigma_h': 'σ_h',
+        'u': 'Поровое u',
+        'risk_score': 'Риск',
+        'plastic_int': 'Пластика'
+    }
+    final_rename = {k: v for k, v in rename_map.items() if k in corr_matrix.columns}
+    corr_matrix = corr_matrix.rename(columns=final_rename, index=final_rename)
 
     fig = go.Figure(data=go.Heatmap(
-        z=matrix,
-        x=labels,
-        y=df['piket'].astype(str),
-        colorscale='RdYlGn_r',
-        zmin=0,
+        z=corr_matrix.values,
+        x=corr_matrix.columns,
+        y=corr_matrix.index,
+        colorscale='RdBu_r',
+        zmin=-1,
         zmax=1,
-        text=matrix,
+        text=corr_matrix.round(2).values,
         texttemplate='%{text}',
         textfont={"size": 10},
-        hoverongaps=False
+        hoverongaps=False,
+        colorbar=dict(title="Корреляция")
     ))
     fig.update_layout(
-        title='Тепловая карта рисков (причины и общий риск)',
-        xaxis_title='Критерий',
-        yaxis_title='Пикетаж (м)',
-        height=600,
+        title='Корреляционная матрица параметров',
+        xaxis_title='Параметры',
+        yaxis_title='Параметры',
+        height=650,
+        width=700,
         template='plotly_white'
     )
     return fig
@@ -709,6 +714,13 @@ if 'results' not in st.session_state:
     st.session_state['results'] = None
 if 'project_name' not in st.session_state:
     st.session_state['project_name'] = "Тоннель №1"
+# Настройки модели
+if 'excess_threshold' not in st.session_state:
+    st.session_state['excess_threshold'] = 0.9
+if 'stability_threshold' not in st.session_state:
+    st.session_state['stability_threshold'] = 0.8
+if 'include_plastic' not in st.session_state:
+    st.session_state['include_plastic'] = False
 
 # Боковая панель
 with st.sidebar:
@@ -749,9 +761,46 @@ with st.sidebar:
     st.header("Имя проекта")
     st.session_state['project_name'] = st.text_input("Название", st.session_state['project_name'])
 
+    st.divider()
+    st.header("Настройки модели")
+    # Слайдер для порога превышения порового давления
+    excess_threshold = st.slider(
+        "Порог превышения порового давления (u / σ_v)",
+        min_value=0.7,
+        max_value=1.0,
+        value=st.session_state['excess_threshold'],
+        step=0.05,
+        help="Чем выше значение, тем меньше пикетов будет считаться красными из-за порового давления."
+    )
+    st.session_state['excess_threshold'] = excess_threshold
+
+    # Слайдер для порога устойчивости
+    stability_threshold = st.slider(
+        "Порог устойчивости (коэффициент запаса)",
+        min_value=0.5,
+        max_value=1.0,
+        value=st.session_state['stability_threshold'],
+        step=0.05,
+        help="Чем ниже значение, тем меньше пикетов будет считаться красными из-за низкой устойчивости."
+    )
+    st.session_state['stability_threshold'] = stability_threshold
+
+    # Чекбокс "Учитывать пластику в критериях красного"
+    include_plastic = st.checkbox(
+        "Учитывать пластику в критериях красного",
+        value=st.session_state['include_plastic'],
+        help="Если включено, то красный цвет присваивается при (exceeds_u и low_stability) ИЛИ (plastic и exceeds_u)."
+    )
+    st.session_state['include_plastic'] = include_plastic
+
     if st.session_state['raw_data'] is not None and st.button("▶ Выполнить расчёт", type="primary"):
         with st.spinner("Выполняется расчёт..."):
-            df_full = compute_full_table(st.session_state['raw_data'])
+            df_full = compute_full_table(
+                st.session_state['raw_data'],
+                excess_threshold=st.session_state['excess_threshold'],
+                stability_threshold=st.session_state['stability_threshold'],
+                include_plastic=st.session_state['include_plastic']
+            )
             st.session_state['results'] = df_full
         st.success("Расчёт завершён!")
 
@@ -767,21 +816,32 @@ if st.session_state['results'] is not None:
     st.success(f"Расчёт выполнен для {len(df_res)} пикетов")
 
     # Вкладки для визуализации
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Продольный разрез", "Эпюры пикета", "Кривые CCM", "Тепловая карта", "Таблица аномалий"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Продольный разрез", "Эпюры пикета", "Кривые CCM", "Корреляционная матрица", "Таблица аномалий"]
+    )
 
     with tab1:
         st.plotly_chart(plot_longitudinal_profile(df_res), use_container_width=True)
 
     with tab2:
-        piket_input = st.number_input("Введите номер пикета", min_value=int(df_res['piket'].min()), max_value=int(df_res['piket'].max()), step=100)
+        piket_input = st.number_input(
+            "Введите номер пикета",
+            min_value=int(df_res['piket'].min()),
+            max_value=int(df_res['piket'].max()),
+            step=100
+        )
         st.plotly_chart(plot_picket_epures(df_res, piket_input), use_container_width=True)
 
     with tab3:
-        selected = st.multiselect("Выберите пикеты для кривых CCM", df_res['piket'].tolist(), default=df_res['piket'].iloc[:3].tolist())
+        selected = st.multiselect(
+            "Выберите пикеты для кривых CCM",
+            df_res['piket'].tolist(),
+            default=df_res['piket'].iloc[:3].tolist()
+        )
         st.plotly_chart(plot_ccm_curves(df_res, selected), use_container_width=True)
 
     with tab4:
-        st.plotly_chart(plot_risk_heatmap(df_res), use_container_width=True)
+        st.plotly_chart(plot_correlation_matrix(df_res), use_container_width=True)
 
     with tab5:
         st.plotly_chart(plot_anomaly_table(df_res), use_container_width=True)
@@ -803,3 +863,6 @@ if st.session_state['results'] is not None:
 
 else:
     st.info("Выполните расчёт, чтобы увидеть результаты.")
+   
+
+   
