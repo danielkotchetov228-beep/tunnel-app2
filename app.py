@@ -124,17 +124,26 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
 
     sigma_v = results.get('sigma_v', 0)
     u = results.get('u', 0)
-    plastic = results.get('plastic_zone', False)  # только для информации
+    plastic = results.get('plastic_zone', False)
+    c = results.get('c', 0)
+    UGW = results.get('UGW', 0)
+    H = results.get('H', 0)
 
+    # 1. Прямые инженерные критерии
+    weak_soil = c < 15
+    high_water = UGW > H - 5
+    dangerous_combination = weak_soil and high_water
+
+    # 2. Классические критерии
     exceeds_u = u > excess_threshold * sigma_v
 
     stability_ratio = 1.0
-    if 'c' in results and 'phi' in results and sigma_v > 0:
+    if 'phi' in results and sigma_v > 0:
         phi_rad = np.radians(results['phi'])
         sigma_eff = sigma_v - u
         if sigma_eff < 0:
             sigma_eff = 0
-        tau_lim = results['c'] + sigma_eff * np.tan(phi_rad)
+        tau_lim = c + sigma_eff * np.tan(phi_rad)
         sigma_h = results.get('sigma_h', 0)
         tau_act = (sigma_v - sigma_h) / 2 if sigma_v > sigma_h else 0.5
         if tau_act > 0:
@@ -143,9 +152,10 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
             stability_ratio = float('inf')
     low_stability = stability_ratio < stability_threshold
 
-    # Новая логика цветов (пластика НЕ влияет на цвет)
-    is_red_now = exceeds_u and low_stability
+    # 3. Итоговый красный
+    is_red_now = dangerous_combination or (exceeds_u and low_stability)
 
+    # Асимметричная память
     if is_red_prev:
         is_red_final = True
         color = 'red'
@@ -155,8 +165,8 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
             color = 'red'
         else:
             is_red_final = False
-            # Жёлтый – если есть превышение ИЛИ низкая устойчивость (пластика не учитывается)
-            if exceeds_u or low_stability:
+            # Жёлтый – предупреждение
+            if (c < 25 and UGW > H - 10) or exceeds_u or low_stability:
                 color = 'yellow'
             else:
                 color = 'green'
@@ -170,127 +180,17 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
     else:
         risk_score = 0.0
 
-    if not np.isfinite(risk_score):
-        risk_score = 1e9
-
     results['color'] = color
     results['risk_score'] = risk_score
     results['is_red'] = is_red_final
     results['stability_ratio'] = stability_ratio
     results['flag_exceeds_u'] = exceeds_u
     results['flag_low_stability'] = low_stability
-    results['flag_plastic'] = plastic  # сохраняем, но не используем для цвета
+    results['flag_plastic'] = plastic
+    results['flag_weak_soil'] = weak_soil
+    results['flag_high_water'] = high_water
 
     return results
-
-def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
-    df = df.copy()
-    df = df.sort_values('piket').reset_index(drop=True)
-    n = len(df)
-
-    for col in df.columns:
-        if df[col].isnull().any():
-            col_mean = df[col].mean(skipna=True)
-            if np.isnan(col_mean):
-                col_mean = 0.0
-            df[col].fillna(col_mean, inplace=True)
-
-    df['anomaly_geomech'] = False
-    df['anomaly_hydro'] = False
-    df['anomaly_geol'] = False
-
-    effective_window = min(window_size, n)
-    if effective_window < 3:
-        df['overall_risk'] = df.get('risk_score', 0)
-        return df
-
-    for i in range(n):
-        start = max(0, i - effective_window // 2)
-        end = min(n, i + effective_window // 2 + 1)
-        window_indices = list(range(start, end))
-        if len(window_indices) < 3:
-            continue
-
-        sigma_v_win = df.loc[window_indices, 'sigma_v'].values
-        sigma_h_win = df.loc[window_indices, 'sigma_h'].values
-        plastic_win = df.loc[window_indices, 'plastic_zone'].astype(int).values
-
-        sigma_v_i = df.loc[i, 'sigma_v']
-        sigma_h_i = df.loc[i, 'sigma_h']
-        plastic_i = df.loc[i, 'plastic_zone']
-
-        mean_v = np.mean(sigma_v_win)
-        std_v = np.std(sigma_v_win)
-        if std_v > 0 and abs(sigma_v_i - mean_v) > sigma_threshold * std_v:
-            df.loc[i, 'anomaly_geomech'] = True
-
-        mean_h = np.mean(sigma_h_win)
-        std_h = np.std(sigma_h_win)
-        if std_h > 0 and abs(sigma_h_i - mean_h) > sigma_threshold * std_h:
-            df.loc[i, 'anomaly_geomech'] = True
-
-        plastic_fraction = np.mean(plastic_win)
-        if (plastic_i == 1 and plastic_fraction < 0.3) or (plastic_i == 0 and plastic_fraction > 0.7):
-            df.loc[i, 'anomaly_geomech'] = True
-
-    if 'H' not in df.columns:
-        df['H'] = 0
-    for i in range(n):
-        if df.loc[i, 'UGW'] > 0.7 * df.loc[i, 'H']:
-            df.loc[i, 'anomaly_hydro'] = True
-
-        start = max(0, i - effective_window // 2)
-        end = min(n, i + effective_window // 2 + 1)
-        window_indices = list(range(start, end))
-        if len(window_indices) < 3:
-            continue
-        u_win = df.loc[window_indices, 'u'].values
-        u_i = df.loc[i, 'u']
-        mean_u = np.mean(u_win)
-        std_u = np.std(u_win)
-        if std_u > 0 and abs(u_i - mean_u) > sigma_threshold * std_u:
-            df.loc[i, 'anomaly_hydro'] = True
-
-    for i in range(n):
-        f_i = df.loc[i, 'f']
-        phi_i = df.loc[i, 'phi']
-        c_i = df.loc[i, 'c']
-
-        if f_i < 3.0 and phi_i > 35.0 and c_i < 20.0:
-            df.loc[i, 'anomaly_geol'] = True
-
-        start = max(0, i - effective_window // 2)
-        end = min(n, i + effective_window // 2 + 1)
-        window_indices = list(range(start, end))
-        if len(window_indices) < 3:
-            continue
-        f_win = df.loc[window_indices, 'f'].values
-        phi_win = df.loc[window_indices, 'phi'].values
-        c_win = df.loc[window_indices, 'c'].values
-
-        mean_f = np.mean(f_win)
-        std_f = np.std(f_win)
-        mean_phi = np.mean(phi_win)
-        std_phi = np.std(phi_win)
-        mean_c = np.mean(c_win)
-        std_c = np.std(c_win)
-
-        if (std_f > 0 and abs(f_i - mean_f) > sigma_threshold * std_f) or \
-           (std_phi > 0 and abs(phi_i - mean_phi) > sigma_threshold * std_phi) or \
-           (std_c > 0 and abs(c_i - mean_c) > sigma_threshold * std_c):
-            df.loc[i, 'anomaly_geol'] = True
-
-    if 'risk_score' in df.columns:
-        df['overall_risk'] = df['risk_score']
-    else:
-        df['overall_risk'] = (df['anomaly_geomech'].astype(int) +
-                              df['anomaly_hydro'].astype(int) +
-                              df['anomaly_geol'].astype(int) +
-                              df['plastic_zone'].astype(int))
-
-    return df
-
-
 def compute_full_table(df_input, excess_threshold=0.9, stability_threshold=0.8, include_plastic=False):
     PENALTY_STATE.clear()
     results_list = []
