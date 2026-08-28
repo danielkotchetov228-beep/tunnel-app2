@@ -40,11 +40,6 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
 
     sigma_v = gamma_kN * H
 
-    tg_45_minus = np.tan(np.pi/4 - phi_rad/2)
-    h_arch = (B + 2 * H * tg_45_minus) / (2 * f) if f > 0 else 0.0
-    if H > 80:
-        h_arch = min(h_arch, H / 3.0)
-
     K_a = np.tan(np.pi/4 - phi_rad/2)**2
     sqrt_K_a = np.sqrt(K_a)
     sigma_h = sigma_v * K_a - 2 * c * sqrt_K_a
@@ -62,42 +57,39 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
     if sigma_0_eff < 0:
         sigma_0_eff = 0.0
 
-    p_i = 0.0
     if sin_phi == 0:
         if sigma_0_eff > c:
             plastic_zone = True
-            plastic_radius = R_0 * (sigma_0_eff / c) if c > 0 else R_0 * 10.0
         else:
             plastic_zone = False
-            plastic_radius = 0.0
     else:
         cot_phi = 1.0 / tan_phi
         term1 = (sigma_0_eff + c * cot_phi) * (1 - sin_phi)
-        term2 = p_i + c * cot_phi
+        term2 = 0.0 + c * cot_phi
         if term2 <= 0:
             plastic_zone = True
-            plastic_radius = R_0 * 100.0
         else:
             ratio = term1 / term2
             exponent = (1 - sin_phi) / (2 * sin_phi)
-            if ratio > 1:
-                R_p = R_0 * (ratio ** exponent)
-                plastic_zone = True
-                plastic_radius = R_p
-            else:
-                plastic_zone = False
-                plastic_radius = 0.0
+            plastic_zone = ratio > 1
 
     return {
         'sigma_v': sigma_v,
         'sigma_h': sigma_h,
         'u': u,
-        'plastic_zone': plastic_zone,
-        'plastic_radius': plastic_radius,
-        'h_arch': h_arch
+        'plastic_zone': plastic_zone
     }
 
-def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, include_plastic=False):
+def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8,
+                  include_plastic=False, yellow_c_threshold=40, yellow_water_gap=15):
+    """
+    Асимметричная штрафная функция с настраиваемыми порогами:
+    - excess_threshold: порог для u / sigma_v (красный/жёлтый)
+    - stability_threshold: порог для stability_ratio (красный/жёлтый)
+    - include_plastic: если True, пластика участвует в критерии красного
+    - yellow_c_threshold: порог сцепления для жёлтого (c < порог)
+    - yellow_water_gap: порог расстояния до УГВ для жёлтого (UGW > H - порог)
+    """
     piket = results.get('piket')
     if piket is None:
         raise ValueError("Missing 'piket' in results")
@@ -113,12 +105,11 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
     UGW = results.get('UGW', 0)
     H = results.get('H', 0)
 
-    # Прямые инженерные критерии
+    # ---------- Критерии красного ----------
     weak_soil = c < 15
     high_water = UGW > H - 5
     dangerous_combination = weak_soil and high_water
 
-    # Классические критерии
     exceeds_u = u > excess_threshold * sigma_v
 
     stability_ratio = 1.0
@@ -136,10 +127,17 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
             stability_ratio = float('inf')
     low_stability = stability_ratio < stability_threshold
 
-    # Итоговый красный
-    is_red_now = dangerous_combination or (exceeds_u and low_stability)
+    # Красный: dangerous_combination ИЛИ (exceeds_u и low_stability)
+    if include_plastic:
+        is_red_now = dangerous_combination or (exceeds_u and low_stability) or (plastic and exceeds_u)
+    else:
+        is_red_now = dangerous_combination or (exceeds_u and low_stability)
 
-    # Асимметричная память
+    # ---------- Критерии жёлтого (новые, более мягкие) ----------
+    yellow_condition = (c < yellow_c_threshold) and (UGW > H - yellow_water_gap)
+    yellow_criteria = yellow_condition or exceeds_u or low_stability
+
+    # ---------- Асимметричная память и финальный цвет ----------
     if is_red_prev:
         is_red_final = True
         color = 'red'
@@ -149,8 +147,7 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
             color = 'red'
         else:
             is_red_final = False
-            # Жёлтый – предупреждение
-            if (c < 25 and UGW > H - 10) or exceeds_u or low_stability:
+            if yellow_criteria:
                 color = 'yellow'
             else:
                 color = 'green'
@@ -176,6 +173,9 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
     results['flag_plastic'] = plastic
     results['flag_weak_soil'] = weak_soil
     results['flag_high_water'] = high_water
+    results['flag_yellow_criteria'] = yellow_criteria
+    results['yellow_c_threshold'] = yellow_c_threshold
+    results['yellow_water_gap'] = yellow_water_gap
 
     return results
 
@@ -286,7 +286,12 @@ def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
 
     return df
 
-def compute_full_table(df_input, excess_threshold=0.9, stability_threshold=0.8, include_plastic=False):
+def compute_full_table(df_input,
+                       excess_threshold=0.9,
+                       stability_threshold=0.8,
+                       include_plastic=False,
+                       yellow_c_threshold=40,
+                       yellow_water_gap=15):
     PENALTY_STATE.clear()
     results_list = []
     for idx, row in df_input.iterrows():
@@ -307,7 +312,14 @@ def compute_full_table(df_input, excess_threshold=0.9, stability_threshold=0.8, 
         res['gamma'] = gamma
         res['f'] = f
         res['UGW'] = UGW
-        res = apply_penalty(res, excess_threshold, stability_threshold, include_plastic)
+        res = apply_penalty(
+            res,
+            excess_threshold=excess_threshold,
+            stability_threshold=stability_threshold,
+            include_plastic=include_plastic,
+            yellow_c_threshold=yellow_c_threshold,
+            yellow_water_gap=yellow_water_gap
+        )
         results_list.append(res)
 
     df_results = pd.DataFrame(results_list)
@@ -315,7 +327,7 @@ def compute_full_table(df_input, excess_threshold=0.9, stability_threshold=0.8, 
     return df_full
 
 # ------------------------------------------------------------
-# 2. ВИЗУАЛИЗАЦИЯ (plotly) - функции без изменений, кроме plot_correlation_matrix
+# 2. ВИЗУАЛИЗАЦИЯ (plotly)
 # ------------------------------------------------------------
 def plot_longitudinal_profile(df):
     fig = go.Figure()
@@ -425,12 +437,12 @@ def plot_correlation_matrix(df):
     df_corr = df.copy()
     df_corr['plastic_int'] = df_corr['plastic_zone'].astype(int)
 
-    numeric_cols = ['H', 'B', 'c', 'phi', 'gamma', 'f', 'UGW', 
-                    'sigma_v', 'sigma_h', 'u', 'risk_score', 'plastic_int']
-    # Добавим флаги, если они есть
-    for col in ['flag_exceeds_u', 'flag_low_stability', 'flag_plastic', 'flag_weak_soil', 'flag_high_water']:
+    numeric_cols = ['H', 'B', 'c', 'phi', 'gamma', 'f', 'UGW', 'u', 'risk_score', 'plastic_int']
+    for col in ['flag_exceeds_u', 'flag_low_stability', 'flag_plastic',
+                'flag_weak_soil', 'flag_high_water', 'flag_yellow_criteria']:
         if col in df_corr.columns:
             numeric_cols.append(col)
+
     available_cols = [col for col in numeric_cols if col in df_corr.columns]
     corr_matrix = df_corr[available_cols].corr()
 
@@ -442,8 +454,6 @@ def plot_correlation_matrix(df):
         'gamma': 'Плотность γ',
         'f': 'Крепость f',
         'UGW': 'УГВ',
-        'sigma_v': 'σ_v',
-        'sigma_h': 'σ_h',
         'u': 'Поровое u',
         'risk_score': 'Риск',
         'plastic_int': 'Пластика',
@@ -451,7 +461,8 @@ def plot_correlation_matrix(df):
         'flag_low_stability': 'Низкая устойч.',
         'flag_plastic': 'Пластика (флаг)',
         'flag_weak_soil': 'Слабый грунт',
-        'flag_high_water': 'Высокий УГВ'
+        'flag_high_water': 'Высокий УГВ',
+        'flag_yellow_criteria': 'Жёлтый критерий'
     }
     final_rename = {k: v for k, v in rename_map.items() if k in corr_matrix.columns}
     corr_matrix = corr_matrix.rename(columns=final_rename, index=final_rename)
@@ -479,8 +490,36 @@ def plot_correlation_matrix(df):
     )
     return fig
 
-def plot_anomaly_table(df):
+def plot_anomaly_table(df, filter_color=None):
+    if filter_color is None:
+        filter_color = st.session_state.get('filter_color', 'Все')
+
     df_display = df.copy()
+    if filter_color != "Все":
+        color_map_filter = {"Зелёные": "green", "Жёлтые": "yellow", "Красные": "red"}
+        target_color = color_map_filter.get(filter_color)
+        if target_color:
+            df_display = df_display[df_display['color'] == target_color]
+
+    def generate_reason(row):
+        reasons = []
+        if row.get('flag_weak_soil', False) and row.get('flag_high_water', False):
+            reasons.append("Слабый грунт + высокий УГВ")
+        if row.get('flag_exceeds_u', False):
+            reasons.append("Превышение порового давления")
+        if row.get('flag_low_stability', False):
+            reasons.append("Низкая устойчивость")
+        if row.get('flag_plastic', False):
+            reasons.append("Пластика")
+        if row.get('flag_yellow_criteria', False):
+            reasons.append("Жёлтый критерий (c + вода)")
+        if not reasons:
+            reasons.append("Нет")
+        return ", ".join(reasons)
+
+    df_display['Причина'] = df_display.apply(generate_reason, axis=1)
+    df_display['risk_score_display'] = df_display['risk_score'].map(lambda x: f"{x:.2f}")
+
     def anomaly_type(row):
         types = []
         if row['anomaly_geomech']:
@@ -491,35 +530,40 @@ def plot_anomaly_table(df):
             types.append('Геол.')
         return ', '.join(types) if types else 'Нет'
     df_display['Тип аномалии'] = df_display.apply(anomaly_type, axis=1)
-    cols = ['piket', 'H', 'sigma_v', 'sigma_h', 'u', 'plastic_zone', 'color', 'Тип аномалии']
+
+    cols = ['piket', 'H', 'sigma_v', 'sigma_h', 'u', 'plastic_zone',
+            'risk_score_display', 'color', 'Тип аномалии', 'Причина']
     table_data = df_display[cols].copy()
     table_data['plastic_zone'] = table_data['plastic_zone'].map({True: 'Да', False: 'Нет'})
+
+    color_map = {'green': 'lightgreen', 'yellow': 'lightyellow', 'red': 'lightcoral'}
+    row_colors = [color_map.get(c, 'white') for c in table_data['color']]
+
     fig = go.Figure(data=[go.Table(
         header=dict(
-            values=list(table_data.columns),
+            values=['Пикетаж', 'H', 'σ_v', 'σ_h', 'u', 'Пластика',
+                    'Риск', 'Цвет', 'Тип аномалии', 'Причина'],
             fill_color='paleturquoise',
             align='center',
             font=dict(size=12)
         ),
         cells=dict(
             values=[table_data[col] for col in table_data.columns],
-            fill_color=[
-                ['lightgreen' if c == 'green' else 'lightyellow' if c == 'yellow' else 'lightcoral'
-                 for c in table_data['color']]
-            ],
+            fill_color=[row_colors],
             align='center',
             font=dict(size=11)
         )
     )])
+
     fig.update_layout(
-        title='Таблица аномалий',
-        height=300 + 30 * len(df),
+        title=f'Таблица аномалий {"(фильтр: " + filter_color + ")" if filter_color != "Все" else ""}',
+        height=300 + 30 * len(table_data),
         template='plotly_white'
     )
     return fig
 
 # ------------------------------------------------------------
-# 3. ГЕНЕРАЦИЯ ОТЧЁТОВ (без изменений)
+# 3. ГЕНЕРАЦИЯ ОТЧЁТОВ
 # ------------------------------------------------------------
 def generate_docx_bytes(df, project_name="Тоннель"):
     doc = Document()
@@ -684,6 +728,7 @@ st.markdown("### 1D скрининг по СП 122.13330.2012, ГОСТ 33153-20
 st.warning("⚠️ Финальное проектное решение принимает главный инженер проекта (ГИП). "
            "Представленные расчёты носят рекомендательный характер и не отменяют экспертизу.")
 
+# Инициализация состояния
 if 'raw_data' not in st.session_state:
     st.session_state['raw_data'] = None
 if 'results' not in st.session_state:
@@ -696,6 +741,12 @@ if 'stability_threshold' not in st.session_state:
     st.session_state['stability_threshold'] = 0.8
 if 'include_plastic' not in st.session_state:
     st.session_state['include_plastic'] = False
+if 'yellow_c_threshold' not in st.session_state:
+    st.session_state['yellow_c_threshold'] = 40
+if 'yellow_water_gap' not in st.session_state:
+    st.session_state['yellow_water_gap'] = 15
+if 'filter_color' not in st.session_state:
+    st.session_state['filter_color'] = "Все"
 
 with st.sidebar:
     st.header("Загрузка данных")
@@ -764,17 +815,52 @@ with st.sidebar:
     )
     st.session_state['include_plastic'] = include_plastic
 
+    st.divider()
+    st.subheader("Настройки жёлтой зоны")
+    yellow_c = st.slider(
+        "Порог сцепления для жёлтого (c)",
+        min_value=20,
+        max_value=60,
+        value=st.session_state['yellow_c_threshold'],
+        step=1,
+        help="Пикеты с c < этого значения могут стать жёлтыми (при близкой воде)."
+    )
+    st.session_state['yellow_c_threshold'] = yellow_c
+
+    yellow_gap = st.slider(
+        "Расстояние до УГВ для жёлтого (м)",
+        min_value=5,
+        max_value=25,
+        value=st.session_state['yellow_water_gap'],
+        step=1,
+        help="Если УГВ ближе к подошве, чем это расстояние (UGW > H - gap), пикет может стать жёлтым."
+    )
+    st.session_state['yellow_water_gap'] = yellow_gap
+
+    st.divider()
+    st.subheader("Фильтр таблицы аномалий")
+    filter_color = st.selectbox(
+        "Показать пикеты",
+        options=["Все", "Зелёные", "Жёлтые", "Красные"],
+        index=0,
+        help="Выберите, какие пикеты отображать в таблице аномалий."
+    )
+    st.session_state['filter_color'] = filter_color
+
     if st.session_state['raw_data'] is not None and st.button("▶ Выполнить расчёт", type="primary"):
         with st.spinner("Выполняется расчёт..."):
             df_full = compute_full_table(
                 st.session_state['raw_data'],
                 excess_threshold=st.session_state['excess_threshold'],
                 stability_threshold=st.session_state['stability_threshold'],
-                include_plastic=st.session_state['include_plastic']
+                include_plastic=st.session_state['include_plastic'],
+                yellow_c_threshold=st.session_state['yellow_c_threshold'],
+                yellow_water_gap=st.session_state['yellow_water_gap']
             )
             st.session_state['results'] = df_full
         st.success("Расчёт завершён!")
 
+# Основная область
 if st.session_state['raw_data'] is None:
     st.info("Загрузите данные через боковую панель или используйте тестовые.")
 else:
@@ -783,7 +869,14 @@ else:
 
 if st.session_state['results'] is not None:
     df_res = st.session_state['results']
-    st.success(f"Расчёт выполнен для {len(df_res)} пикетов")
+    color_counts = df_res['color'].value_counts()
+    n_red = color_counts.get('red', 0)
+    n_yellow = color_counts.get('yellow', 0)
+    n_green = color_counts.get('green', 0)
+    st.success(
+        f"Расчёт выполнен для {len(df_res)} пикетов. "
+        f"🟢 Зелёных: {n_green}, 🟡 Жёлтых: {n_yellow}, 🔴 Красных: {n_red}"
+    )
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["Продольный разрез", "Эпюры пикета", "Кривые CCM", "Корреляционная матрица", "Таблица аномалий"]
@@ -813,7 +906,10 @@ if st.session_state['results'] is not None:
         st.plotly_chart(plot_correlation_matrix(df_res), use_container_width=True)
 
     with tab5:
-        st.plotly_chart(plot_anomaly_table(df_res), use_container_width=True)
+        st.plotly_chart(
+            plot_anomaly_table(df_res, filter_color=st.session_state.get('filter_color', 'Все')),
+            use_container_width=True
+        )
 
     st.divider()
     st.subheader("Генерация отчётов")
