@@ -24,13 +24,6 @@ PENALTY_STATE = {}
 # 1. ВЫЧИСЛИТЕЛЬНОЕ ЯДРО (ОБНОВЛЁННОЕ)
 # ------------------------------------------------------------
 def calculate_piket(H, B, c, phi, gamma, f, UGW):
-    """
-    Расчёт параметров для одного пикета.
-    Вертикальное давление: полное горное давление sigma_v = gamma_kN * H.
-    Боковое давление: по методу Фотта с использованием нового sigma_v.
-    Пластическая зона: по эффективному напряжению sigma_0_eff = gamma_kN * H - u.
-    """
-    # ---------- Защита от экстремальных значений ----------
     if c < 1.0:
         c = 1.0
     if phi < 5.0:
@@ -38,45 +31,38 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
     if f < 0.5:
         f = 0.5
 
-    gamma_kN = gamma * 9.81                     # кН/м³
+    gamma_kN = gamma * 9.81
     phi_rad = np.radians(phi)
     sin_phi = np.sin(phi_rad)
-    cos_phi = np.cos(phi_rad)
     tan_phi = np.tan(phi_rad)
     if tan_phi < 0.1:
         tan_phi = 0.1
 
-    # ---------- Вертикальное давление (полное горное) ----------
     sigma_v = gamma_kN * H
 
-    # ---------- (Информационно) высота свода обрушения по Протодьяконову ----------
     tg_45_minus = np.tan(np.pi/4 - phi_rad/2)
     h_arch = (B + 2 * H * tg_45_minus) / (2 * f) if f > 0 else 0.0
     if H > 80:
         h_arch = min(h_arch, H / 3.0)
 
-    # ---------- Боковое давление (метод Фотта) ----------
     K_a = np.tan(np.pi/4 - phi_rad/2)**2
     sqrt_K_a = np.sqrt(K_a)
     sigma_h = sigma_v * K_a - 2 * c * sqrt_K_a
     if sigma_h < 0:
         sigma_h = 0.0
 
-    # ---------- Поровое давление ----------
     gamma_w = 9.81
     if UGW < H:
         u = gamma_w * (H - UGW)
     else:
         u = 0.0
 
-    # ---------- Пластическая зона (по эффективным напряжениям) ----------
     R_0 = B / 2.0
     sigma_0_eff = gamma_kN * H - u
     if sigma_0_eff < 0:
         sigma_0_eff = 0.0
 
     p_i = 0.0
-
     if sin_phi == 0:
         if sigma_0_eff > c:
             plastic_zone = True
@@ -88,7 +74,6 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
         cot_phi = 1.0 / tan_phi
         term1 = (sigma_0_eff + c * cot_phi) * (1 - sin_phi)
         term2 = p_i + c * cot_phi
-
         if term2 <= 0:
             plastic_zone = True
             plastic_radius = R_0 * 100.0
@@ -112,7 +97,6 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
         'h_arch': h_arch
     }
 
-
 def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, include_plastic=False):
     piket = results.get('piket')
     if piket is None:
@@ -129,12 +113,12 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
     UGW = results.get('UGW', 0)
     H = results.get('H', 0)
 
-    # 1. Прямые инженерные критерии
+    # Прямые инженерные критерии
     weak_soil = c < 15
     high_water = UGW > H - 5
     dangerous_combination = weak_soil and high_water
 
-    # 2. Классические критерии
+    # Классические критерии
     exceeds_u = u > excess_threshold * sigma_v
 
     stability_ratio = 1.0
@@ -152,7 +136,7 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
             stability_ratio = float('inf')
     low_stability = stability_ratio < stability_threshold
 
-    # 3. Итоговый красный
+    # Итоговый красный
     is_red_now = dangerous_combination or (exceeds_u and low_stability)
 
     # Асимметричная память
@@ -180,6 +164,9 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
     else:
         risk_score = 0.0
 
+    if not np.isfinite(risk_score):
+        risk_score = 1e9
+
     results['color'] = color
     results['risk_score'] = risk_score
     results['is_red'] = is_red_final
@@ -191,6 +178,114 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
     results['flag_high_water'] = high_water
 
     return results
+
+def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
+    df = df.copy()
+    df = df.sort_values('piket').reset_index(drop=True)
+    n = len(df)
+
+    for col in df.columns:
+        if df[col].isnull().any():
+            col_mean = df[col].mean(skipna=True)
+            if np.isnan(col_mean):
+                col_mean = 0.0
+            df[col].fillna(col_mean, inplace=True)
+
+    df['anomaly_geomech'] = False
+    df['anomaly_hydro'] = False
+    df['anomaly_geol'] = False
+
+    effective_window = min(window_size, n)
+    if effective_window < 3:
+        df['overall_risk'] = df.get('risk_score', 0)
+        return df
+
+    for i in range(n):
+        start = max(0, i - effective_window // 2)
+        end = min(n, i + effective_window // 2 + 1)
+        window_indices = list(range(start, end))
+        if len(window_indices) < 3:
+            continue
+
+        sigma_v_win = df.loc[window_indices, 'sigma_v'].values
+        sigma_h_win = df.loc[window_indices, 'sigma_h'].values
+        plastic_win = df.loc[window_indices, 'plastic_zone'].astype(int).values
+
+        sigma_v_i = df.loc[i, 'sigma_v']
+        sigma_h_i = df.loc[i, 'sigma_h']
+        plastic_i = df.loc[i, 'plastic_zone']
+
+        mean_v = np.mean(sigma_v_win)
+        std_v = np.std(sigma_v_win)
+        if std_v > 0 and abs(sigma_v_i - mean_v) > sigma_threshold * std_v:
+            df.loc[i, 'anomaly_geomech'] = True
+
+        mean_h = np.mean(sigma_h_win)
+        std_h = np.std(sigma_h_win)
+        if std_h > 0 and abs(sigma_h_i - mean_h) > sigma_threshold * std_h:
+            df.loc[i, 'anomaly_geomech'] = True
+
+        plastic_fraction = np.mean(plastic_win)
+        if (plastic_i == 1 and plastic_fraction < 0.3) or (plastic_i == 0 and plastic_fraction > 0.7):
+            df.loc[i, 'anomaly_geomech'] = True
+
+    if 'H' not in df.columns:
+        df['H'] = 0
+    for i in range(n):
+        if df.loc[i, 'UGW'] > 0.7 * df.loc[i, 'H']:
+            df.loc[i, 'anomaly_hydro'] = True
+
+        start = max(0, i - effective_window // 2)
+        end = min(n, i + effective_window // 2 + 1)
+        window_indices = list(range(start, end))
+        if len(window_indices) < 3:
+            continue
+        u_win = df.loc[window_indices, 'u'].values
+        u_i = df.loc[i, 'u']
+        mean_u = np.mean(u_win)
+        std_u = np.std(u_win)
+        if std_u > 0 and abs(u_i - mean_u) > sigma_threshold * std_u:
+            df.loc[i, 'anomaly_hydro'] = True
+
+    for i in range(n):
+        f_i = df.loc[i, 'f']
+        phi_i = df.loc[i, 'phi']
+        c_i = df.loc[i, 'c']
+
+        if f_i < 3.0 and phi_i > 35.0 and c_i < 20.0:
+            df.loc[i, 'anomaly_geol'] = True
+
+        start = max(0, i - effective_window // 2)
+        end = min(n, i + effective_window // 2 + 1)
+        window_indices = list(range(start, end))
+        if len(window_indices) < 3:
+            continue
+        f_win = df.loc[window_indices, 'f'].values
+        phi_win = df.loc[window_indices, 'phi'].values
+        c_win = df.loc[window_indices, 'c'].values
+
+        mean_f = np.mean(f_win)
+        std_f = np.std(f_win)
+        mean_phi = np.mean(phi_win)
+        std_phi = np.std(phi_win)
+        mean_c = np.mean(c_win)
+        std_c = np.std(c_win)
+
+        if (std_f > 0 and abs(f_i - mean_f) > sigma_threshold * std_f) or \
+           (std_phi > 0 and abs(phi_i - mean_phi) > sigma_threshold * std_phi) or \
+           (std_c > 0 and abs(c_i - mean_c) > sigma_threshold * std_c):
+            df.loc[i, 'anomaly_geol'] = True
+
+    if 'risk_score' in df.columns:
+        df['overall_risk'] = df['risk_score']
+    else:
+        df['overall_risk'] = (df['anomaly_geomech'].astype(int) +
+                              df['anomaly_hydro'].astype(int) +
+                              df['anomaly_geol'].astype(int) +
+                              df['plastic_zone'].astype(int))
+
+    return df
+
 def compute_full_table(df_input, excess_threshold=0.9, stability_threshold=0.8, include_plastic=False):
     PENALTY_STATE.clear()
     results_list = []
@@ -219,9 +314,8 @@ def compute_full_table(df_input, excess_threshold=0.9, stability_threshold=0.8, 
     df_full = detect_anomalies(df_results)
     return df_full
 
-
 # ------------------------------------------------------------
-# 2. ВИЗУАЛИЗАЦИЯ (plotly)
+# 2. ВИЗУАЛИЗАЦИЯ (plotly) - функции без изменений, кроме plot_correlation_matrix
 # ------------------------------------------------------------
 def plot_longitudinal_profile(df):
     fig = go.Figure()
@@ -261,7 +355,6 @@ def plot_longitudinal_profile(df):
         height=600
     )
     return fig
-
 
 def plot_picket_epures(df, piket_index):
     row = df[df['piket'] == piket_index]
@@ -304,7 +397,6 @@ def plot_picket_epures(df, piket_index):
     )
     return fig
 
-
 def plot_ccm_curves(df, selected_pikets=None):
     if selected_pikets is None:
         selected_pikets = df['piket'].iloc[:3].tolist()
@@ -329,17 +421,16 @@ def plot_ccm_curves(df, selected_pikets=None):
     )
     return fig
 
-
 def plot_correlation_matrix(df):
-    """
-    Интерактивная корреляционная матрица для числовых параметров.
-    Отображает корреляции между входными данными и результатами расчёта.
-    """
     df_corr = df.copy()
     df_corr['plastic_int'] = df_corr['plastic_zone'].astype(int)
 
     numeric_cols = ['H', 'B', 'c', 'phi', 'gamma', 'f', 'UGW', 
                     'sigma_v', 'sigma_h', 'u', 'risk_score', 'plastic_int']
+    # Добавим флаги, если они есть
+    for col in ['flag_exceeds_u', 'flag_low_stability', 'flag_plastic', 'flag_weak_soil', 'flag_high_water']:
+        if col in df_corr.columns:
+            numeric_cols.append(col)
     available_cols = [col for col in numeric_cols if col in df_corr.columns]
     corr_matrix = df_corr[available_cols].corr()
 
@@ -355,7 +446,12 @@ def plot_correlation_matrix(df):
         'sigma_h': 'σ_h',
         'u': 'Поровое u',
         'risk_score': 'Риск',
-        'plastic_int': 'Пластика'
+        'plastic_int': 'Пластика',
+        'flag_exceeds_u': 'Превышение u',
+        'flag_low_stability': 'Низкая устойч.',
+        'flag_plastic': 'Пластика (флаг)',
+        'flag_weak_soil': 'Слабый грунт',
+        'flag_high_water': 'Высокий УГВ'
     }
     final_rename = {k: v for k, v in rename_map.items() if k in corr_matrix.columns}
     corr_matrix = corr_matrix.rename(columns=final_rename, index=final_rename)
@@ -382,7 +478,6 @@ def plot_correlation_matrix(df):
         template='plotly_white'
     )
     return fig
-
 
 def plot_anomaly_table(df):
     df_display = df.copy()
@@ -423,9 +518,8 @@ def plot_anomaly_table(df):
     )
     return fig
 
-
 # ------------------------------------------------------------
-# 3. ГЕНЕРАЦИЯ ОТЧЁТОВ
+# 3. ГЕНЕРАЦИЯ ОТЧЁТОВ (без изменений)
 # ------------------------------------------------------------
 def generate_docx_bytes(df, project_name="Тоннель"):
     doc = Document()
@@ -548,7 +642,6 @@ def generate_docx_bytes(df, project_name="Тоннель"):
     bio.seek(0)
     return bio.getvalue()
 
-
 def generate_xlsx_bytes(df):
     wb = Workbook()
     ws = wb.active
@@ -581,7 +674,6 @@ def generate_xlsx_bytes(df):
     bio.seek(0)
     return bio.getvalue()
 
-
 # ------------------------------------------------------------
 # 4. STREAMLIT ИНТЕРФЕЙС
 # ------------------------------------------------------------
@@ -589,18 +681,15 @@ st.set_page_config(page_title="Геомеханический скрининг �
 st.title("🚇 Геомеханический скрининг тоннелей")
 st.markdown("### 1D скрининг по СП 122.13330.2012, ГОСТ 33153-2014, ГОСТ 32836-2014")
 
-# Дисклеймер
 st.warning("⚠️ Финальное проектное решение принимает главный инженер проекта (ГИП). "
            "Представленные расчёты носят рекомендательный характер и не отменяют экспертизу.")
 
-# Инициализация состояния
 if 'raw_data' not in st.session_state:
     st.session_state['raw_data'] = None
 if 'results' not in st.session_state:
     st.session_state['results'] = None
 if 'project_name' not in st.session_state:
     st.session_state['project_name'] = "Тоннель №1"
-# Настройки модели
 if 'excess_threshold' not in st.session_state:
     st.session_state['excess_threshold'] = 0.9
 if 'stability_threshold' not in st.session_state:
@@ -608,7 +697,6 @@ if 'stability_threshold' not in st.session_state:
 if 'include_plastic' not in st.session_state:
     st.session_state['include_plastic'] = False
 
-# Боковая панель
 with st.sidebar:
     st.header("Загрузка данных")
     uploaded_file = st.file_uploader("Выберите CSV или Excel файл", type=["csv", "xlsx"])
@@ -649,7 +737,6 @@ with st.sidebar:
 
     st.divider()
     st.header("Настройки модели")
-    # Слайдер для порога превышения порового давления
     excess_threshold = st.slider(
         "Порог превышения порового давления (u / σ_v)",
         min_value=0.7,
@@ -660,7 +747,6 @@ with st.sidebar:
     )
     st.session_state['excess_threshold'] = excess_threshold
 
-    # Слайдер для порога устойчивости
     stability_threshold = st.slider(
         "Порог устойчивости (коэффициент запаса)",
         min_value=0.5,
@@ -671,7 +757,6 @@ with st.sidebar:
     )
     st.session_state['stability_threshold'] = stability_threshold
 
-    # Чекбокс "Учитывать пластику в критериях красного"
     include_plastic = st.checkbox(
         "Учитывать пластику в критериях красного",
         value=st.session_state['include_plastic'],
@@ -690,7 +775,6 @@ with st.sidebar:
             st.session_state['results'] = df_full
         st.success("Расчёт завершён!")
 
-# Основная область
 if st.session_state['raw_data'] is None:
     st.info("Загрузите данные через боковую панель или используйте тестовые.")
 else:
@@ -701,7 +785,6 @@ if st.session_state['results'] is not None:
     df_res = st.session_state['results']
     st.success(f"Расчёт выполнен для {len(df_res)} пикетов")
 
-    # Вкладки для визуализации
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["Продольный разрез", "Эпюры пикета", "Кривые CCM", "Корреляционная матрица", "Таблица аномалий"]
     )
@@ -732,7 +815,6 @@ if st.session_state['results'] is not None:
     with tab5:
         st.plotly_chart(plot_anomaly_table(df_res), use_container_width=True)
 
-    # Отчёты
     st.divider()
     st.subheader("Генерация отчётов")
     col1, col2 = st.columns(2)
@@ -749,6 +831,3 @@ if st.session_state['results'] is not None:
 
 else:
     st.info("Выполните расчёт, чтобы увидеть результаты.")
-   
-
-   
