@@ -114,12 +114,6 @@ def calculate_piket(H, B, c, phi, gamma, f, UGW):
 
 
 def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, include_plastic=False):
-    """
-    Асимметричная штрафная функция с настраиваемыми порогами.
-    - excess_threshold: порог для u / sigma_v (по умолчанию 0.9)
-    - stability_threshold: порог для stability_ratio (по умолчанию 0.8)
-    - include_plastic: если True, то пластика участвует в критерии красного
-    """
     piket = results.get('piket')
     if piket is None:
         raise ValueError("Missing 'piket' in results")
@@ -130,12 +124,10 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
 
     sigma_v = results.get('sigma_v', 0)
     u = results.get('u', 0)
-    plastic = results.get('plastic_zone', False)
+    plastic = results.get('plastic_zone', False)  # только для информации
 
-    # 1. Превышение порового давления с настраиваемым порогом
     exceeds_u = u > excess_threshold * sigma_v
 
-    # 2. Коэффициент устойчивости (по эффективным напряжениям)
     stability_ratio = 1.0
     if 'c' in results and 'phi' in results and sigma_v > 0:
         phi_rad = np.radians(results['phi'])
@@ -151,13 +143,9 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
             stability_ratio = float('inf')
     low_stability = stability_ratio < stability_threshold
 
-    # 3. Логика красного с учётом include_plastic
-    if include_plastic:
-        is_red_now = (exceeds_u and low_stability) or (plastic and exceeds_u)
-    else:
-        is_red_now = exceeds_u and low_stability
+    # Новая логика цветов (пластика НЕ влияет на цвет)
+    is_red_now = exceeds_u and low_stability
 
-    # Асимметричная память
     if is_red_prev:
         is_red_final = True
         color = 'red'
@@ -167,15 +155,14 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
             color = 'red'
         else:
             is_red_final = False
-            # Жёлтый: любое одно из условий (exceeds_u, low_stability, plastic)
-            if exceeds_u or low_stability or plastic:
+            # Жёлтый – если есть превышение ИЛИ низкая устойчивость (пластика не учитывается)
+            if exceeds_u or low_stability:
                 color = 'yellow'
             else:
                 color = 'green'
 
     PENALTY_STATE[piket]['is_red'] = is_red_final
 
-    # Риск
     if color == 'red':
         risk_score = 1.0
     elif color == 'yellow':
@@ -192,10 +179,9 @@ def apply_penalty(results, excess_threshold=0.9, stability_threshold=0.8, includ
     results['stability_ratio'] = stability_ratio
     results['flag_exceeds_u'] = exceeds_u
     results['flag_low_stability'] = low_stability
-    results['flag_plastic'] = plastic
+    results['flag_plastic'] = plastic  # сохраняем, но не используем для цвета
 
     return results
-
 
 def detect_anomalies(df, window_size=5, sigma_threshold=3.0):
     df = df.copy()
